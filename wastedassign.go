@@ -1,7 +1,6 @@
 package wastedassign
 
 import (
-	"errors"
 	"fmt"
 	"go/ast"
 	"go/token"
@@ -31,65 +30,45 @@ type wastedAssignStruct struct {
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
-	// Plundered from buildssa.Run.
 	prog := ssa.NewProgram(pass.Fset, ssa.NaiveForm)
 
-	// Create SSA packages for all imports.
-	// Order is not significant.
-	created := make(map[*types.Package]bool)
-	var createAll func(pkgs []*types.Package)
-	createAll = func(pkgs []*types.Package) {
-		for _, p := range pkgs {
-			if !created[p] {
-				created[p] = true
-				prog.CreatePackage(p, nil, nil, true)
-				createAll(p.Imports())
-			}
-		}
+	// Create SSA packages for direct imports.
+	for _, p := range pass.Pkg.Imports() {
+		prog.CreatePackage(p, nil, nil, true)
 	}
-	createAll(pass.Pkg.Imports())
 
 	// Create and build the primary package.
 	ssapkg := prog.CreatePackage(pass.Pkg, pass.Files, pass.TypesInfo, false)
 	ssapkg.Build()
 
+	// Collect source functions in source order, including anonymous functions.
 	var srcFuncs []*ssa.Function
 	for _, f := range pass.Files {
 		for _, decl := range f.Decls {
-			if fdecl, ok := decl.(*ast.FuncDecl); ok {
-
-				// SSA will not build a Function
-				// for a FuncDecl named blank.
-				// That's arguably too strict but
-				// relaxing it would break uniqueness of
-				// names of package members.
-				if fdecl.Name.Name == "_" {
-					continue
-				}
-
-				// (init functions have distinct Func
-				// objects named "init" and distinct
-				// ssa.Functions named "init#1", ...)
-
-				fn := pass.TypesInfo.Defs[fdecl.Name].(*types.Func)
-				if fn == nil {
-					return nil, errors.New("failed to get func's typesinfo")
-				}
-
-				f := ssapkg.Prog.FuncValue(fn)
-				if f == nil {
-					return nil, errors.New("failed to get func's SSA-form intermediate representation")
-				}
-
-				var addAnons func(f *ssa.Function)
-				addAnons = func(f *ssa.Function) {
-					srcFuncs = append(srcFuncs, f)
-					for _, anon := range f.AnonFuncs {
-						addAnons(anon)
-					}
-				}
-				addAnons(f)
+			fdecl, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
 			}
+			// SSA does not build a Function for a FuncDecl named blank.
+			if fdecl.Name.Name == "_" {
+				continue
+			}
+			fn, ok := pass.TypesInfo.Defs[fdecl.Name].(*types.Func)
+			if !ok || fn == nil {
+				continue
+			}
+			f := ssapkg.Prog.FuncValue(fn)
+			if f == nil {
+				continue
+			}
+			var addAnons func(*ssa.Function)
+			addAnons = func(f *ssa.Function) {
+				srcFuncs = append(srcFuncs, f)
+				for _, anon := range f.AnonFuncs {
+					addAnons(anon)
+				}
+			}
+			addAnons(f)
 		}
 	}
 
@@ -104,20 +83,32 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	var wastedAssignMap []wastedAssignStruct
 
 	for _, sf := range srcFuncs {
+		// Build a set of locals for O(1) lookup instead of scanning the slice
+		// for every store operand.
+		localSet := make(map[*ssa.Alloc]bool, len(sf.Locals))
+		for _, l := range sf.Locals {
+			localSet[l] = true
+		}
+
 		for _, bl := range sf.Blocks {
-			blCopy := *bl
-			for _, ist := range bl.Instrs {
-				blCopy.Instrs = rmInstrFromInstrs(blCopy.Instrs, ist)
+			for i, ist := range bl.Instrs {
 				if _, ok := ist.(*ssa.Store); !ok {
 					continue
 				}
 
 				var buf [10]*ssa.Value
 				for _, op := range ist.Operands(buf[:0]) {
-					if (*op) == nil || !opInLocals(sf.Locals, op) {
+					alloc, ok := (*op).(*ssa.Alloc)
+					if !ok || !localSet[alloc] {
 						continue
 					}
 
+					// Pass only the instructions after this store so that
+					// isNextOperationToOpIsStore doesn't re-examine it.
+					// Use a slice expression (O(1)) rather than rebuilding
+					// the instruction list (O(n)) for every instruction.
+					blCopy := *bl
+					blCopy.Instrs = bl.Instrs[i+1:]
 					reason := isNextOperationToOpIsStore([]*ssa.BasicBlock{&blCopy}, op, nil)
 					if reason == notWasted {
 						continue
@@ -127,14 +118,9 @@ func run(pass *analysis.Pass) (interface{}, error) {
 						continue
 					}
 
-					v, ok := (*op).(*ssa.Alloc)
-					if !ok {
-						// This block should never have been executed.
-						continue
-					}
 					wastedAssignMap = append(wastedAssignMap, wastedAssignStruct{
 						pos:    ist.Pos(),
-						reason: reason.String(v),
+						reason: reason.String(alloc),
 					})
 				}
 			}
@@ -234,7 +220,6 @@ func isNextOperationToOpIsStore(bls []*ssa.BasicBlock, currentOp *ssa.Value, hav
 
 func rmSameBlock(bls []*ssa.BasicBlock, currentBl *ssa.BasicBlock) []*ssa.BasicBlock {
 	var rto []*ssa.BasicBlock
-
 	for _, bl := range bls {
 		if bl != currentBl {
 			rto = append(rto, bl)
@@ -246,25 +231,6 @@ func rmSameBlock(bls []*ssa.BasicBlock, currentBl *ssa.BasicBlock) []*ssa.BasicB
 func containReassignedSoon(ws []wastedReason) bool {
 	for _, w := range ws {
 		if w == reassignedSoon {
-			return true
-		}
-	}
-	return false
-}
-
-func rmInstrFromInstrs(instrs []ssa.Instruction, instrToRm ssa.Instruction) []ssa.Instruction {
-	var rto []ssa.Instruction
-	for _, i := range instrs {
-		if i != instrToRm {
-			rto = append(rto, i)
-		}
-	}
-	return rto
-}
-
-func opInLocals(locals []*ssa.Alloc, op *ssa.Value) bool {
-	for _, l := range locals {
-		if *op == ssa.Value(l) {
 			return true
 		}
 	}
