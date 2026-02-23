@@ -142,7 +142,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	}
 
 	for _, was := range wastedAssignMap {
-		pass.Reportf(was.pos, was.reason)
+		pass.Reportf(was.pos, "%s", was.reason)
 	}
 
 	return nil, nil
