@@ -1,9 +1,28 @@
+version: "2"
 linters:
-  disable-all: true
+  default: none
+  enable:
+    - govet
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - path: (.+)\.go$
+        text: 'printf: non-constant format string'
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
   enable:
     - goimports
-    - govet
-
-issues:
-  exclude:
-    - "printf: non-constant format string"
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
