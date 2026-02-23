@@ -1,0 +1,9 @@
+linters:
+  disable-all: true
+  enable:
+    - goimports
+    - govet
+
+issues:
+  exclude:
+    - "printf: non-constant format string"
