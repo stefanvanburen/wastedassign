@@ -236,5 +236,3 @@ func containReassignedSoon(ws []wastedReason) bool {
 	}
 	return false
 }
-
-
